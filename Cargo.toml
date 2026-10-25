@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = ["crates/clipcraft-app", "crates/clipcraft-core", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+clipcraft-core = { path = "crates/clipcraft-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+# Lint gates follow omatrack's policy: the checks that catch real defects are
+# errors, and every deliberate omission is written down instead of silently
+# tolerated. Run them through `cargo xtask lint`, which adds `-D warnings` on
+# top so nothing is merely "warned about".
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Deliberate omissions, mirroring the rationale comments in omatrack's
+# .clang-tidy:
+#   module_name_repetitions    - `job::JobEvent` reads better than
+#                                inventing a second vocabulary for one concept.
+#   missing_errors_doc         - this is an application; the error types are
+#   missing_panics_doc           reachable from the caller in one screen.
+#   must_use_candidate         - noise on small private helpers.
+#   struct_excessive_bools     - row flags are bools by nature.
+#   cast_precision_loss        - byte counts become f64 meters, by design.
+#   cast_possible_truncation     Only meter fractions and ages are cast, and
+#   cast_sign_loss               their ranges are bounded.
+#   similar_names              - (src, dst), (used, uuid).
+#   too_many_lines             - render functions are linear on purpose.
+#   option_if_let_else         - `if let` keeps ownership visible.
+#   multiple_crate_versions    - the dependency graph is not ours to fix.
+#   cast_lossless              - explicit `as` in meter math is clearer than
+#                                From chains.
+#
+# `unreachable_pub` is left off the workspace set: the only library here is a
+# workspace-internal one, so every `pub` is unreachable from outside by
+# construction and the check would only produce noise.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+struct_excessive_bools = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+option_if_let_else = "allow"
+multiple_crate_versions = "allow"
+
+[profile.dev]
+debug = "limited"
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+# gpui-pre-macros leaves a helper ungated in release builds while its module is
+# gated on debug_assertions; enable it for the host proc-macro only.
+[profile.release.package.gpui-pre-macros]
+debug-assertions = true

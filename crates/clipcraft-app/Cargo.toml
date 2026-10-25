@@ -1,0 +1,30 @@
+[package]
+name = "clipcraft-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPUI window for clipcraft: drop movies in, the compress scripts run"
+
+[[bin]]
+name = "clipcraft"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui-kit = { version = "=0.6.1", default-features = false, features = ["assets"] }
+gpui-omarchy = "0.1.2"
+clipcraft-core = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The window harness: it lets the tests draw a real frame.
+gpui-kit = { version = "=0.6.1", default-features = false, features = [
+    "assets",
+    "test-support",
+] }
+tempfile = "3"
