@@ -588,7 +588,6 @@ fn row_view(
         name: file_name(&row.path),
     };
     let drop_line = theme.accent;
-    let path = row.path.clone();
 
     div()
         .id(("row", row.id))
@@ -641,7 +640,7 @@ fn row_view(
                         .hover(|style| style.text_color(theme.accent))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.reveal(&path, cx);
+                            this.reveal_row(id, cx);
                         })),
                 ),
         )
@@ -682,9 +681,9 @@ fn detail(row: &Row, theme: &Theme, cx: &Context<'_, ClipCraft>) -> Div {
         .text_size(text::CAPTION);
     match &row.status {
         Status::Waiting => lane.child(dim(
-            row.sent
-                .as_ref()
-                .map_or_else(String::new, |name| format!("queued: {name}")),
+            row.sent.as_ref().map_or_else(String::new, |_| {
+                "queued: takes the preset in use when it starts".into()
+            }),
             theme,
         )),
         Status::Compressing {

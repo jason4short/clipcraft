@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clipcraft_core::job::{JobEvent, JobHandle, Outcome, Task};
+use clipcraft_core::job::{JobEvent, JobHandle, Outcome, Settings, Task};
 use clipcraft_core::options::Options;
 use clipcraft_core::presets::{Presets, Saved};
 use clipcraft_core::sample::{self, Sample};
@@ -349,7 +349,22 @@ impl ClipCraft {
         self.presets.current()
     }
 
+    /// The preset in use, as the queue reads it.
+    fn settings(&self) -> Settings {
+        let preset = self.preset();
+        Settings {
+            name: preset.name.clone(),
+            replace: preset.replace,
+            options: preset.options,
+        }
+    }
+
+    /// Save the presets, and hand the one in use to a running queue: each
+    /// movie that starts from now on gets it.
     fn save_presets(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.set_settings(self.settings());
+        }
         let Some(path) = &self.presets_path else {
             return;
         };
@@ -679,7 +694,6 @@ impl ClipCraft {
     pub fn add_paths(&mut self, paths: &[PathBuf], cx: &mut Context<'_, Self>) {
         let found = scan::expand(paths);
         let mut added = 0;
-        let preset = self.preset().clone();
         for path in found.movies {
             if self.listed(&path) {
                 continue;
@@ -696,7 +710,7 @@ impl ClipCraft {
                 status: Status::Waiting,
             });
             if self.running() {
-                self.send(id, &preset);
+                self.send(id);
             }
             added += 1;
         }
@@ -841,16 +855,40 @@ impl ClipCraft {
     }
 
     /// Show `path` selected in a Finder window.
+    /// A file that is gone shows its folder instead.
     pub fn reveal(&mut self, path: &Path, cx: &mut Context<'_, Self>) {
-        let shown = std::process::Command::new("/usr/bin/open")
-            .arg("-R")
-            .arg(path)
-            .spawn()
-            .and_then(|mut child| child.wait());
+        let mut open = std::process::Command::new("/usr/bin/open");
+        if path.exists() {
+            open.arg("-R").arg(path);
+        } else if let Some(folder) = path.parent().filter(|dir| dir.is_dir()) {
+            open.arg(folder);
+        } else {
+            self.tell(format!("{} is not there any more.", path.display()));
+            cx.notify();
+            return;
+        }
+        let shown = open.spawn().and_then(|mut child| child.wait());
         if !shown.is_ok_and(|status| status.success()) {
             self.tell(format!("Cannot show {} in Finder.", path.display()));
             cx.notify();
         }
+    }
+
+    /// Show row `id`'s movie in Finder: the original, or once that has
+    /// been replaced, the compressed movie that took its place.
+    pub fn reveal_row(&mut self, id: usize, cx: &mut Context<'_, Self>) {
+        let Some(row) = self.rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        let path = match &row.status {
+            Status::Finished(Outcome::Compressed { output, .. })
+                if !row.path.exists() =>
+            {
+                output.clone()
+            }
+            _ => row.path.clone(),
+        };
+        self.reveal(&path, cx);
     }
 
     /// Sort by size, smallest first; again, largest first. The queue runs
@@ -949,7 +987,7 @@ impl ClipCraft {
             return;
         }
         self.notice = None;
-        self.handle = Some(JobHandle::spawn([], preset.options.at_once));
+        self.handle = Some(JobHandle::spawn([], self.settings()));
         self.all_done = false;
         self.run = Some(Run {
             started: Instant::now(),
@@ -983,14 +1021,14 @@ impl ClipCraft {
             }
         ));
         for id in waiting {
-            self.send(id, &preset);
+            self.send(id);
         }
         Self::poll(cx);
         cx.notify();
     }
 
     /// Hand one waiting movie to the running queue.
-    fn send(&mut self, id: usize, preset: &Saved) {
+    fn send(&mut self, id: usize) {
         let Some(handle) = &self.handle else {
             return;
         };
@@ -1002,12 +1040,7 @@ impl ClipCraft {
                 Status::Finished(Outcome::Failed("cannot find ffmpeg".into()));
             return;
         };
-        row.sent = Some(format!(
-            "{}, {}",
-            preset.name,
-            preset.options.quality_label()
-        ));
-        row.output = Some(preset.options.output(&row.path));
+        row.sent = Some(String::new());
         if let Some(run) = &mut self.run {
             run.sent_bytes += row.bytes;
         }
@@ -1015,8 +1048,6 @@ impl ClipCraft {
             id,
             input: row.path.clone(),
             ffmpeg,
-            replace: preset.replace,
-            options: preset.options,
         });
     }
 
@@ -1074,8 +1105,10 @@ impl ClipCraft {
         let mut done = false;
         for event in events {
             match event {
-                JobEvent::Started { id } => {
+                JobEvent::Started { id, settings } => {
                     if let Some(row) = self.row_mut(id) {
+                        row.sent = Some(settings.label());
+                        row.output = Some(settings.options.output(&row.path));
                         row.status = Status::Compressing {
                             fraction: None,
                             eta: None,

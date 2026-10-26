@@ -2,7 +2,9 @@
 //! report of what is happening.
 //!
 //! The queue stays open while it runs: movies added mid-run join the end,
-//! and an empty queue waits for more until the run is stopped.
+//! and an empty queue waits for more until the run is stopped. Each movie
+//! is encoded with the settings as they are when it starts, so a change
+//! mid-run applies to every movie not yet begun.
 //!
 //! Every file has its own progress, result and error. ffmpeg's progress
 //! line, `time=00:01:23.45 ... speed=2.1x`, is read against the movie's
@@ -20,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use crate::options::{Options, command_line};
+use crate::options::{MAX_AT_ONCE, Options, command_line};
 use crate::size::human_bytes;
 use crate::tools::search_path;
 
@@ -30,7 +32,7 @@ const TAIL: usize = 12;
 /// How long an empty queue sleeps before looking again.
 const IDLE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// One movie to compress, and how.
+/// One movie to compress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     /// The caller's own id for it.
@@ -38,9 +40,24 @@ pub struct Task {
     pub input: PathBuf,
     /// ffmpeg itself, found with [`crate::tools::find`].
     pub ffmpeg: PathBuf,
+}
+
+/// How movies are compressed: the preset in use, read again as each movie
+/// starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// The preset's name, for the list.
+    pub name: String,
     /// Replace the original once the result checks out.
     pub replace: bool,
     pub options: Options,
+}
+
+impl Settings {
+    /// "Compress Video, CRF 26".
+    pub fn label(&self) -> String {
+        format!("{}, {}", self.name, self.options.quality_label())
+    }
 }
 
 /// How one file went.
@@ -61,8 +78,10 @@ pub enum Outcome {
 /// What the runner reports, in order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobEvent {
+    /// A movie began, with these settings.
     Started {
         id: usize,
+        settings: Settings,
     },
     Progress {
         id: usize,
@@ -92,17 +111,25 @@ pub struct JobHandle {
     queue: Arc<Mutex<VecDeque<Task>>>,
     events: Receiver<JobEvent>,
     stop: Arc<AtomicBool>,
+    settings: Arc<Mutex<Settings>>,
     /// Each worker's ffmpeg process group, while one runs.
     pids: Vec<Arc<AtomicU32>>,
 }
 
 impl JobHandle {
-    /// Run `tasks`, and any pushed later, `workers` at a time.
-    pub fn spawn(tasks: impl IntoIterator<Item = Task>, workers: u8) -> Self {
+    /// Run `tasks`, and any pushed later, with `settings` until they are
+    /// changed. As many run at once as the settings say, up to
+    /// [`MAX_AT_ONCE`].
+    pub fn spawn(
+        tasks: impl IntoIterator<Item = Task>,
+        settings: Settings,
+    ) -> Self {
         let queue = Arc::new(Mutex::new(tasks.into_iter().collect()));
         let (tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let workers = usize::from(workers.max(1));
+        let settings = Arc::new(Mutex::new(settings));
+        let busy = Arc::new(AtomicUsize::new(0));
+        let workers = usize::from(MAX_AT_ONCE);
         let live = Arc::new(AtomicUsize::new(workers));
         let pids: Vec<_> =
             (0..workers).map(|_| Arc::new(AtomicU32::new(0))).collect();
@@ -111,6 +138,8 @@ impl JobHandle {
                 queue: Arc::clone(&queue),
                 tx: tx.clone(),
                 stop: Arc::clone(&stop),
+                settings: Arc::clone(&settings),
+                busy: Arc::clone(&busy),
                 pid: Arc::clone(pid),
                 live: Arc::clone(&live),
             };
@@ -120,7 +149,15 @@ impl JobHandle {
             queue,
             events,
             stop,
+            settings,
             pids,
+        }
+    }
+
+    /// Use `settings` for every movie that starts from now on.
+    pub fn set_settings(&self, settings: Settings) {
+        if let Ok(mut current) = self.settings.lock() {
+            *current = settings;
         }
     }
 
@@ -190,6 +227,9 @@ struct Worker {
     queue: Arc<Mutex<VecDeque<Task>>>,
     tx: Sender<JobEvent>,
     stop: Arc<AtomicBool>,
+    settings: Arc<Mutex<Settings>>,
+    /// Workers compressing now, held to the settings' "at once".
+    busy: Arc<AtomicUsize>,
     pid: Arc<AtomicU32>,
     /// Workers still running; the last one out reports Done.
     live: Arc<AtomicUsize>,
@@ -206,13 +246,16 @@ impl Worker {
 
     fn run(&self) {
         while !self.stopped() {
-            let next = self.queue.lock().ok().and_then(|mut q| q.pop_front());
-            let Some(task) = next else {
+            let Some((task, settings)) = self.next() else {
                 std::thread::sleep(IDLE);
                 continue;
             };
-            self.send(JobEvent::Started { id: task.id });
-            let outcome = self.compress(&task);
+            self.send(JobEvent::Started {
+                id: task.id,
+                settings: settings.clone(),
+            });
+            let outcome = self.compress(&task, &settings);
+            self.busy.fetch_sub(1, Ordering::SeqCst);
             self.send(JobEvent::Finished {
                 id: task.id,
                 outcome,
@@ -223,13 +266,34 @@ impl Worker {
         }
     }
 
-    fn compress(&self, task: &Task) -> Outcome {
+    /// The next movie and the settings now, if there is one and fewer
+    /// than "at once" are running.
+    fn next(&self) -> Option<(Task, Settings)> {
+        let settings = self.settings.lock().ok()?.clone();
+        let at_once =
+            usize::from(settings.options.at_once.clamp(1, MAX_AT_ONCE));
+        // Counting and taking happen under the queue's lock, so two
+        // workers cannot both take the last free place.
+        let task = {
+            let mut queue = self.queue.lock().ok()?;
+            if self.busy.load(Ordering::SeqCst) >= at_once {
+                return None;
+            }
+            let task = queue.pop_front()?;
+            self.busy.fetch_add(1, Ordering::SeqCst);
+            drop(queue);
+            task
+        };
+        Some((task, settings))
+    }
+
+    fn compress(&self, task: &Task, settings: &Settings) -> Outcome {
         let (id, input) = (task.id, task.input.as_path());
         let Ok(meta) = std::fs::metadata(input) else {
             return Outcome::Failed("the file is not there any more".into());
         };
         let before = meta.len();
-        let output = task.options.output(input);
+        let output = settings.options.output(input);
         if output.exists() {
             return Outcome::Skipped(format!(
                 "already compressed: {}",
@@ -238,20 +302,23 @@ impl Worker {
         }
         // Replacing renames the result to the original's name with the new
         // extension, which must not be a different movie.
-        let result = task.options.result(input, task.replace);
-        if task.replace && result != input && result.exists() {
+        let result = settings.options.result(input, settings.replace);
+        if settings.replace && result != input && result.exists() {
             return Outcome::Skipped(format!(
                 "replacing would overwrite {}",
                 file_name(&result)
             ));
         }
-        if task.options.skip_hevc
+        if settings.options.skip_hevc
             && video_codec(input).as_deref() == Some("hevc")
         {
             return Outcome::Skipped("already HEVC".into());
         }
         let duration = duration(input);
-        let args = task.options.ffmpeg_args(input, &output, has_audio(input));
+        let args =
+            settings
+                .options
+                .ffmpeg_args(input, &output, has_audio(input));
         self.send(JobEvent::Line {
             id,
             text: command_line("ffmpeg", &args),
@@ -312,7 +379,7 @@ impl Worker {
         }
         match status {
             Ok(status) if status.success() => {
-                self.finish(task, &output, &result, duration, before)
+                self.finish(task, settings, &output, &result, duration, before)
             }
             status => {
                 let _ = std::fs::remove_file(&output);
@@ -331,6 +398,7 @@ impl Worker {
     fn finish(
         &self,
         task: &Task,
+        settings: &Settings,
         output: &Path,
         result: &Path,
         duration: Option<f64>,
@@ -338,7 +406,7 @@ impl Worker {
     ) -> Outcome {
         let input = task.input.as_path();
         let made = std::fs::metadata(output).map_or(0, |meta| meta.len());
-        let saving = u64::from(task.options.min_saving.min(100));
+        let saving = u64::from(settings.options.min_saving.min(100));
         if saving > 0 && made * 100 > before * (100 - saving) {
             let _ = std::fs::remove_file(output);
             return Outcome::Skipped(format!(
@@ -347,7 +415,7 @@ impl Worker {
                 human_bytes(made)
             ));
         }
-        if task.options.keep_dates
+        if settings.options.keep_dates
             && let Err(err) = copy_dates(input, output)
         {
             self.send(JobEvent::Line {
@@ -355,7 +423,7 @@ impl Worker {
                 text: format!("cannot copy the dates: {err}"),
             });
         }
-        if task.replace {
+        if settings.replace {
             let length = self::duration(output);
             let same = duration
                 .zip(length)
@@ -577,9 +645,16 @@ mod tests {
             id,
             input,
             ffmpeg: ffmpeg.to_path_buf(),
+        }
+    }
+
+    fn settings(at_once: u8) -> Settings {
+        Settings {
+            name: "Test".into(),
             replace: false,
             options: Options {
                 skip_hevc: false,
+                at_once,
                 ..Options::AERIAL
             },
         }
@@ -641,7 +716,7 @@ mod tests {
                 task(0, dir.join("good.mov"), &ffmpeg),
                 task(1, dir.join("bad.mov"), &ffmpeg),
             ],
-            1,
+            settings(1),
         );
         let mut events = Vec::new();
         until(&handle, &mut events, |e| finished(e) == 2);
@@ -693,15 +768,15 @@ mod tests {
         {
             std::fs::write(dir.join(name), body).expect("write");
         }
-        let replacing = |id, name: &str| {
-            let mut task = task(id, dir.join(name), &ffmpeg);
-            task.replace = true;
-            task.options.min_saving = 0;
-            task
-        };
+        let mut replacing = settings(1);
+        replacing.replace = true;
+        replacing.options.min_saving = 0;
         let handle = JobHandle::spawn(
-            [replacing(0, "clip.wmv"), replacing(1, "b.mov")],
-            1,
+            [
+                task(0, dir.join("clip.wmv"), &ffmpeg),
+                task(1, dir.join("b.mov"), &ffmpeg),
+            ],
+            replacing,
         );
         let mut events = Vec::new();
         until(&handle, &mut events, |e| finished(e) == 2);
@@ -733,7 +808,7 @@ mod tests {
                 task(0, dir.join("a.mov"), &ffmpeg),
                 task(1, dir.join("b.mov"), &ffmpeg),
             ],
-            2,
+            settings(2),
         );
         let mut events = Vec::new();
         until(&handle, &mut events, |e| finished(e) == 2);
@@ -755,10 +830,41 @@ mod tests {
     }
 
     #[test]
+    fn settings_are_read_as_each_movie_starts() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = temp.path();
+        let ffmpeg = fake_ffmpeg(dir, "");
+        std::fs::write(dir.join("a.mov"), "1234567890").expect("write");
+        let handle = JobHandle::spawn([], settings(1));
+        let mut later = settings(1);
+        later.name = "Later".into();
+        later.options.gpu = false;
+        handle.set_settings(later.clone());
+        handle.push(task(0, dir.join("a.mov"), &ffmpeg));
+        let mut events = Vec::new();
+        until(&handle, &mut events, |e| finished(e) == 1);
+        handle.stop();
+        assert!(
+            events.contains(&JobEvent::Started {
+                id: 0,
+                settings: later
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Line { text, .. }
+                if text.contains("-c:v libx265"))),
+            "the CPU encoder, as changed: {events:?}"
+        );
+    }
+
+    #[test]
     fn the_waiting_queue_can_be_reordered() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let ffmpeg = fake_ffmpeg(temp.path(), "");
-        let handle = JobHandle::spawn([], 1);
+        let handle = JobHandle::spawn([], settings(1));
         handle.stop();
         // Once the worker is gone, nothing takes from the queue.
         let mut events = Vec::new();
@@ -794,7 +900,7 @@ wait"#,
                 task(0, dir.join("a.mov"), &ffmpeg),
                 task(1, dir.join("b.mov"), &ffmpeg),
             ],
-            1,
+            settings(1),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.join("a_compressed.mp4").exists() {
